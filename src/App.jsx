@@ -494,6 +494,52 @@ function clearBalanceSnapshots() {
   localStorage.removeItem(BALANCE_SNAPSHOTS_KEY);
 }
 
+async function deriveSecretKey(passcode, saltBytes) {
+  const passcodeBytes = new TextEncoder().encode(passcode);
+  const baseKey = await crypto.subtle.importKey("raw", passcodeBytes, "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: 210000,
+      hash: "SHA-256",
+    },
+    baseKey,
+    {
+      name: "AES-GCM",
+      length: 256,
+    },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptSecretBlob(secretText, passcode) {
+  const salt = randomBytesArray(16);
+  const iv = randomBytesArray(12);
+  const key = await deriveSecretKey(passcode, salt);
+  const payload = new TextEncoder().encode(secretText);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, payload);
+  return {
+    version: 1,
+    salt: toBase64Url(salt),
+    iv: toBase64Url(iv),
+    data: toBase64Url(encrypted),
+  };
+}
+
+async function decryptSecretBlob(encryptedBlob, passcode) {
+  if (!encryptedBlob?.salt || !encryptedBlob?.iv || !encryptedBlob?.data) {
+    throw new Error("Invalid secret payload");
+  }
+  const salt = fromBase64Url(encryptedBlob.salt);
+  const iv = fromBase64Url(encryptedBlob.iv);
+  const data = fromBase64Url(encryptedBlob.data);
+  const key = await deriveSecretKey(passcode, salt);
+  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+  return new TextDecoder().decode(decrypted);
+}
+
 function loadStoredList(key) {
   try {
     const raw = localStorage.getItem(key);
@@ -551,6 +597,9 @@ export default function App() {
 
   const [networkId, setNetworkId] = useState(DEFAULT_NETWORK_ID);
   const [networkMenuOpen, setNetworkMenuOpen] = useState(false);
+  const [recoveryPasscode, setRecoveryPasscode] = useState("");
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [recoveryData, setRecoveryData] = useState(null);
   const [balances, setBalances] = useState({
     loading: false,
     error: "",
@@ -601,10 +650,13 @@ export default function App() {
   });
   const [pullDistance, setPullDistance] = useState(0);
   const [pullRefreshing, setPullRefreshing] = useState(false);
+  const [toastOffsetX, setToastOffsetX] = useState(0);
+  const [toastDragging, setToastDragging] = useState(false);
   const pullStartYRef = useRef(null);
   const walletScrollRef = useRef(null);
   const networkMenuRef = useRef(null);
   const balanceSnapshotsRef = useRef(loadBalanceSnapshots());
+  const toastStartXRef = useRef(0);
   const PULL_TRIGGER = 72;
   const PULL_MAX = 110;
 
@@ -688,10 +740,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!notice) return undefined;
-    const timer = setTimeout(() => setNotice(""), 2500);
+    if (!error && !notice) return undefined;
+    if (toastDragging) return undefined;
+    const timer = setTimeout(() => {
+      setError("");
+      setNotice("");
+    }, 5000);
     return () => clearTimeout(timer);
-  }, [notice]);
+  }, [error, notice, toastDragging]);
+
+  useEffect(() => {
+    setToastOffsetX(0);
+    setToastDragging(false);
+  }, [error, notice]);
 
   useEffect(() => {
     if (view === "wallet") return;
@@ -699,6 +760,8 @@ export default function App() {
     setPullDistance(0);
     setPullRefreshing(false);
     setNetworkMenuOpen(false);
+    setRecoveryPasscode("");
+    setRecoveryData(null);
   }, [view]);
 
   useEffect(() => {
@@ -965,10 +1028,18 @@ export default function App() {
     setError("");
     try {
       const encryptedJson = await draftWallet.encrypt(passcode);
+      const recoveryPayload = await encryptSecretBlob(
+        JSON.stringify({
+          phrase: isPhraseMode(setupMode) ? normalizePhrase(generatedPhrase) : "",
+          privateKey: draftWallet.privateKey,
+        }),
+        passcode
+      );
       const vaultData = {
         version: 1,
         address: draftWallet.address,
         encryptedJson,
+        recoveryPayload,
         networkId,
         source: setupMode,
         createdAt: new Date().toISOString(),
@@ -1573,6 +1644,78 @@ export default function App() {
     }
   }
 
+  function clearToast() {
+    setError("");
+    setNotice("");
+    setToastOffsetX(0);
+    setToastDragging(false);
+  }
+
+  function handleToastPointerDown(event) {
+    toastStartXRef.current = event.clientX;
+    setToastDragging(true);
+  }
+
+  function handleToastPointerMove(event) {
+    if (!toastDragging) return;
+    const deltaX = event.clientX - toastStartXRef.current;
+    const clamped = Math.max(-220, Math.min(220, deltaX));
+    setToastOffsetX(clamped);
+  }
+
+  function handleToastPointerEnd() {
+    if (!toastDragging) return;
+    if (Math.abs(toastOffsetX) > 96) {
+      clearToast();
+      return;
+    }
+    setToastDragging(false);
+    setToastOffsetX(0);
+  }
+
+  async function revealRecoveryData() {
+    if (!wallet || !vault) {
+      setError("Unlock your wallet first.");
+      return;
+    }
+    if (!PASSCODE_RULE.test(recoveryPasscode)) {
+      setError("Enter your 6-digit passcode to verify.");
+      return;
+    }
+
+    if (biometricEnabled) {
+      const approved = await verifyWithBiometrics("view recovery data");
+      if (!approved) return;
+    }
+
+    setRecoveryBusy(true);
+    setError("");
+    try {
+      const unlocked = await Wallet.fromEncryptedJson(vault.encryptedJson, recoveryPasscode);
+      let phrase = "";
+      let privateKey = unlocked.privateKey;
+
+      if (vault.recoveryPayload) {
+        const decoded = await decryptSecretBlob(vault.recoveryPayload, recoveryPasscode);
+        const parsed = JSON.parse(decoded);
+        if (typeof parsed?.phrase === "string") {
+          phrase = parsed.phrase;
+        }
+        if (typeof parsed?.privateKey === "string") {
+          privateKey = parsed.privateKey;
+        }
+      }
+
+      setRecoveryData({ phrase, privateKey });
+      setRecoveryPasscode("");
+      setNotice("Recovery data unlocked.");
+    } catch (recoveryError) {
+      setError("Verification failed. Check passcode.");
+    } finally {
+      setRecoveryBusy(false);
+    }
+  }
+
   async function copyToClipboard(text, successMessage = "Copied successfully.") {
     try {
       await navigator.clipboard.writeText(text);
@@ -1758,7 +1901,7 @@ export default function App() {
   function renderWelcome() {
     return (
       <section className="screen">
-        <div className="panel panel-large">
+        <div className="panel panel-large onboarding-panel">
           <p className="label">Secure Start</p>
           <h1>Your crypto wallet, built for control.</h1>
           <p className="support">Create a new wallet or import an existing one using a seed phrase or private key.</p>
@@ -1781,7 +1924,7 @@ export default function App() {
     const words = generatedPhrase ? generatedPhrase.split(" ") : [];
     return (
       <section className="screen">
-        <div className="panel">
+        <div className="panel onboarding-panel">
           <p className="label">Create Wallet</p>
           <h2>Choose recovery phrase length</h2>
           <div className="segment">
@@ -1829,7 +1972,8 @@ export default function App() {
           ) : (
             <p className="hint">Generate your phrase to continue.</p>
           )}
-          <button className="text-btn" type="button" onClick={() => setView("welcome")}>
+          <button className="back-btn" type="button" onClick={() => setView("welcome")}>
+            <IconArrowLeft />
             Back
           </button>
         </div>
@@ -1840,7 +1984,7 @@ export default function App() {
   function renderImport() {
     return (
       <section className="screen">
-        <div className="panel">
+        <div className="panel onboarding-panel">
           <p className="label">Import Wallet</p>
           <h2>Choose import method</h2>
           <div className="segment">
@@ -1859,6 +2003,19 @@ export default function App() {
               Private key
             </button>
           </div>
+          <div className="import-callout">
+            {setupMode === "import-phrase" ? (
+              <>
+                <strong>Use your 12 or 24 recovery words</strong>
+                <p>Keep word order exact and separate each word with a space.</p>
+              </>
+            ) : (
+              <>
+                <strong>Use your wallet private key</strong>
+                <p>Paste your key in 0x format. It stays encrypted on this device.</p>
+              </>
+            )}
+          </div>
 
           {setupMode === "import-phrase" ? (
             <>
@@ -1869,7 +2026,7 @@ export default function App() {
                 id="import-phrase"
                 value={importPhrase}
                 onChange={(event) => setImportPhrase(event.target.value)}
-                rows={4}
+                rows={5}
                 placeholder="word1 word2 word3 ..."
               />
               <button className="primary-btn full" type="button" onClick={handleImportPhrase}>
@@ -1894,7 +2051,8 @@ export default function App() {
             </>
           )}
 
-          <button className="text-btn" type="button" onClick={() => setView("welcome")}>
+          <button className="back-btn" type="button" onClick={() => setView("welcome")}>
+            <IconArrowLeft />
             Back
           </button>
         </div>
@@ -1905,7 +2063,7 @@ export default function App() {
   function renderPasscode() {
     return (
       <section className="screen">
-        <div className="panel">
+        <div className="panel onboarding-panel">
           <p className="label">Passcode</p>
           <h2>Create 6-digit passcode</h2>
           <label className="field-label" htmlFor="passcode">
@@ -1944,7 +2102,7 @@ export default function App() {
     const phraseWords = generatedPhrase.split(" ");
     return (
       <section className="screen">
-        <div className="panel">
+        <div className="panel onboarding-panel">
           <p className="label">Security Check</p>
           <h2>Confirm sensitive details</h2>
           <label className="field-label" htmlFor="security-passcode">
@@ -2006,7 +2164,8 @@ export default function App() {
           <button className="primary-btn full" type="button" disabled={busy} onClick={finishSetup}>
             {busy ? "Securing wallet..." : "Finish setup"}
           </button>
-          <button className="text-btn" type="button" onClick={() => setView("passcode")}>
+          <button className="back-btn" type="button" onClick={() => setView("passcode")}>
+            <IconArrowLeft />
             Back
           </button>
           {isPhraseMode(setupMode) && phraseWords.length > 0 ? (
@@ -2579,6 +2738,73 @@ export default function App() {
                 </div>
               </article>
               <article>
+                <p>Recovery Vault</p>
+                <strong>{recoveryData ? "Recovery unlocked for this session" : "Reveal seed phrase or private key"}</strong>
+                <label className="field-label" htmlFor="recovery-passcode">
+                  Verify with passcode
+                </label>
+                <input
+                  id="recovery-passcode"
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={recoveryPasscode}
+                  onChange={(event) => setRecoveryPasscode(event.target.value.replace(/\D/g, ""))}
+                  placeholder="******"
+                />
+                <div className="tool-actions">
+                  <button className="ghost-btn" type="button" disabled={recoveryBusy} onClick={revealRecoveryData}>
+                    <IconShield />
+                    {recoveryBusy ? "Verifying..." : "Verify & Reveal"}
+                  </button>
+                  {recoveryData ? (
+                    <button
+                      className="ghost-btn"
+                      type="button"
+                      onClick={() => {
+                        setRecoveryData(null);
+                        setRecoveryPasscode("");
+                      }}
+                    >
+                      <IconLock />
+                      Hide
+                    </button>
+                  ) : null}
+                </div>
+                {recoveryData ? (
+                  <div className="recovery-box">
+                    <small>Private key</small>
+                    <code>{recoveryData.privateKey}</code>
+                    <button
+                      className="ghost-btn"
+                      type="button"
+                      onClick={() => copyToClipboard(recoveryData.privateKey, "Private key copied.")}
+                    >
+                      <IconCopy />
+                      Copy private key
+                    </button>
+                    {recoveryData.phrase ? (
+                      <>
+                        <small>Secret phrase</small>
+                        <code>{recoveryData.phrase}</code>
+                        <button
+                          className="ghost-btn"
+                          type="button"
+                          onClick={() => copyToClipboard(recoveryData.phrase, "Secret phrase copied.")}
+                        >
+                          <IconCopy />
+                          Copy phrase
+                        </button>
+                      </>
+                    ) : (
+                      <p className="hint">Secret phrase is unavailable for this wallet backup.</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="hint">Identity check required before showing sensitive recovery data.</p>
+                )}
+              </article>
+              <article>
                 <p>Explorer</p>
                 <strong>{activeNetwork.name}</strong>
                 <a href={activeNetwork.explorerTxBaseUrl.replace("/tx/", "/")} target="_blank" rel="noreferrer">
@@ -2744,7 +2970,7 @@ export default function App() {
   const isDarkToneView = view === "wallet" || view === "unlock";
 
   return (
-    <div className="app-bg">
+    <div className={`app-bg ${isDarkToneView ? "app-bg-wallet" : "app-bg-onboarding"}`}>
       <div className={`app-shell ${view === "wallet" || view === "unlock" ? "app-shell-wallet" : ""}`}>
         {view !== "wallet" ? renderHeader() : null}
         {view === "welcome" && renderWelcome()}
@@ -2757,7 +2983,19 @@ export default function App() {
         {view === "loading" ? <p className="support center">Loading wallet...</p> : null}
 
         {toast ? (
-          <div className={`toast toast-${toast.type} ${isDarkToneView ? "toast-toned" : ""}`} role="status" aria-live="polite">
+          <div
+            className={`toast toast-${toast.type} ${isDarkToneView ? "toast-toned" : ""}${toastDragging ? " toast-swiping" : ""}`}
+            role="status"
+            aria-live="polite"
+            onPointerDown={handleToastPointerDown}
+            onPointerMove={handleToastPointerMove}
+            onPointerUp={handleToastPointerEnd}
+            onPointerCancel={handleToastPointerEnd}
+            style={{
+              transform: `translateX(calc(-50% + ${toastOffsetX}px))`,
+              opacity: Math.max(0.45, 1 - Math.abs(toastOffsetX) / 220),
+            }}
+          >
             <div className="toast-icon">{toast.icon}</div>
             <div className="toast-body">
               <strong>{toast.title}</strong>
@@ -2801,6 +3039,15 @@ function IconKey() {
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <circle cx="8" cy="12" r="3" />
       <path d="M11 12h9M16 9v6M20 10v4" />
+    </svg>
+  );
+}
+
+function IconArrowLeft() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m14.5 6.5-5 5.5 5 5.5" />
+      <path d="M10 12h8" />
     </svg>
   );
 }
